@@ -1,2 +1,2 @@
-# Attendance-Monitoring-System-Code
+# ITE260-ITE 366 FINAL-PROJECT-CODE
 console based code
