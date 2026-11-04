@@ -1,0 +1,1660 @@
+from datetime import datetime, timedelta
+
+
+# ==========================================================
+#  ATTENDANCE MONITORING SYSTEM
+#  Students log their own attendance; teacher supervises everything.
+# ==========================================================
+
+
+# ---------------- DATA (temporary, in-memory lists) ----------------
+# Nothing is saved to a file. The data lives only while the program is
+# running, and the program starts again with this sample data.
+students = [
+    ["02-2627-010147", "Juan Dela Cruz", "FB1-BSIT-03"],
+    ["02-2627-010148", "Maria Santos", "FB1-BSIT-03"],
+    ["02-2627-010200", "Pedro Reyes", "FB1-BSIT-01"],
+]
+
+
+# subject record: [name, section, start_time, end_time, [schedule days...], crosses_midnight]
+subjects = [
+    ["ITE 260", "FB1-BSIT-03", "08:00 AM", "10:00 AM", ["Monday", "Wednesday"], False],
+    ["ITE 366", "FB1-BSIT-03", "01:00 PM", "03:00 PM", ["Tuesday", "Thursday"], False],
+]
+
+
+attendance = []   # [student_id, name, section, subject, quarter, date, time, status]
+
+
+# Sections created by the teacher in Add Subject. A new section is saved here so it
+# stays available (Students, Attendance, Attendance Summary...) even before it has students.
+created_sections = []
+
+
+# Attendance is tracked starting on this date. From here on, every scheduled
+# class that nobody logged into is automatically recorded as Absent.
+ATTENDANCE_START_DATE = datetime(2026, 10, 3).date()
+
+
+# Every class session (date + subject + section) that was already checked for
+# missing students, so the same session is never marked twice.
+processed_sessions = []
+
+
+TEACHER_USERNAME = "TEACHER-LOGIN"      # same teacher login as before (it was the hidden Teacher ID)
+TEACHER_PASSWORD = "admin123"
+current_quarter = "P1"
+
+
+LATE_AFTER_MINUTES = 15     # more than this many minutes late  -> Late
+ABSENT_AFTER_MINUTES = 90   # more than this many minutes late  -> Absent
+
+
+VALID_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+
+
+# ==========================================================
+#  INPUT HELPERS  (Space = cancel)
+# ==========================================================
+class CancelInput(Exception):
+    """Raised when the user types a Space to cancel what they are doing."""
+    pass
+
+
+
+
+CANCEL_HINT = "(Type a Space and press Enter at any time to cancel.)"
+
+
+
+
+def ask(prompt):
+    """Works like input(), but if the user types only a Space (then Enter),
+    the current process is cancelled. Just pressing Enter still gives a
+    blank answer, so 'leave blank for all' and 'press Enter to skip' still work."""
+    raw = input(prompt)
+    if raw != "" and raw.strip() == "":
+        raise CancelInput()
+    return raw.strip()
+
+
+
+
+def run_action(action, *args):
+    """Runs one menu action. If the user cancels with a Space, we just go
+    back to the menu that called it (the program does not close)."""
+    try:
+        action(*args)
+    except CancelInput:
+        print("\nCancelled. Returning to the previous menu.")
+
+
+
+
+def choose_option(title, options, back_label="Back", error_text="Invalid choice. Please try again."):
+    """Shows a numbered list with a 'Back' option as the last number.
+    Keeps asking until the teacher enters a valid number, so a wrong
+    answer never leaves the menu. Returns the chosen position in the
+    list (0 for the first option), or None if Back was chosen."""
+    print("\n" + title)
+    for i in range(len(options)):
+        print(str(i + 1) + ". " + options[i])
+    back_number = len(options) + 1
+    print(str(back_number) + ". " + back_label)
+
+
+    while True:
+        raw = ask("Enter your choice: ")
+        if raw.isdigit() and 1 <= int(raw) <= back_number:
+            number = int(raw)
+            if number == back_number:
+                return None
+            return number - 1
+        print(error_text)
+
+
+
+
+def choose_from_table(prompt, count):
+    """Used after a numbered table was printed. Keeps asking until the
+    teacher enters a number that is in the table. Pressing Enter alone
+    goes back (returns None). Otherwise returns the position (0 = first row)."""
+    while True:
+        raw = ask(prompt)
+        if raw == "":
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= count:
+            return int(raw) - 1
+        print("Invalid choice. Please try again.")
+
+
+
+
+def ask_yes_no(prompt):
+    """Keeps asking until the answer is exactly yes or no. Returns True or False."""
+    while True:
+        answer = ask(prompt).lower()
+        if answer == "yes":
+            return True
+        if answer == "no":
+            return False
+        print("Invalid choice. Please type 'yes' or 'no'.")
+
+
+
+
+# ==========================================================
+#  TABLE HELPERS
+# ==========================================================
+def print_table(headers, rows):
+    """Prints a simple text table. Each column is as wide as its longest value."""
+    widths = []
+    for h in headers:
+        widths.append(len(h))
+    for row in rows:
+        for i in range(len(row)):
+            if len(str(row[i])) > widths[i]:
+                widths[i] = len(str(row[i]))
+
+
+    border = "+"
+    for w in widths:
+        border = border + "-" * (w + 2) + "+"
+
+
+    header_line = "|"
+    for i in range(len(headers)):
+        header_line = header_line + " " + headers[i].ljust(widths[i]) + " |"
+
+
+    print(border)
+    print(header_line)
+    print(border)
+    for row in rows:
+        line = "|"
+        for i in range(len(row)):
+            line = line + " " + str(row[i]).ljust(widths[i]) + " |"
+        print(line)
+    print(border)
+
+
+
+
+def print_students_table(student_list, numbered=True):
+    """Shows students as a table. numbered=False leaves out the No. column
+    (used when only one student is shown)."""
+    rows = []
+    for i in range(len(student_list)):
+        s = student_list[i]
+        if numbered:
+            rows.append([i + 1, s[0], s[1], s[2]])
+        else:
+            rows.append([s[0], s[1], s[2]])
+    if numbered:
+        print_table(["No.", "Student ID", "Student Name", "Section"], rows)
+    else:
+        print_table(["Student ID", "Student Name", "Section"], rows)
+
+
+
+
+# ==========================================================
+#  VALIDATION HELPERS
+# ==========================================================
+def is_valid_student_id(id_text):
+    """
+    Matches the required format: 02-2627-010147
+    14 characters total: 2 digits, '-', 4 digits, '-', 6 digits.
+    """
+    if len(id_text) != 14:
+        return False
+    if id_text[2] != "-" or id_text[7] != "-":
+        return False
+    part1 = id_text[0:2]
+    part2 = id_text[3:7]
+    part3 = id_text[8:14]
+    return part1.isdigit() and part2.isdigit() and part3.isdigit()
+
+
+def is_valid_student_name(name_text):
+    """
+    A student name may only contain letters and normal spaces.
+    Numbers and symbols (such as @ # . , -) are not allowed.
+    Example: Juan Dela Cruz
+    """
+    for ch in name_text:
+        if ch != " " and not ch.isalpha():
+            return False
+    return True
+
+
+
+
+def is_valid_section_name(section_text):
+    """
+    A section name may only contain letters, numbers, and hyphens (no spaces or
+    symbols), for example FB1-BSIT-04. It cannot start or end with a hyphen, cannot
+    have two hyphens in a row, and can be at most 20 characters long.
+    """
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-"
+    if section_text == "" or len(section_text) > 20:
+        return False
+    if section_text.startswith("-") or section_text.endswith("-") or "--" in section_text:
+        return False
+    for ch in section_text:
+        if ch not in allowed:
+            return False
+    return True
+
+
+
+
+def is_valid_time(t):
+    """Strict 'HH:MM AM/PM' format only, e.g. '08:00 AM'."""
+    if len(t) != 8:
+        return False
+    if t[2] != ":" or t[5] != " ":
+        return False
+    hour_text = t[0:2]
+    min_text = t[3:5]
+    ampm = t[6:8]
+    if not (hour_text.isdigit() and min_text.isdigit()):
+        return False
+    hour = int(hour_text)
+    minute = int(min_text)
+    if hour < 1 or hour > 12:
+        return False
+    if minute < 0 or minute > 59:
+        return False
+    if ampm != "AM" and ampm != "PM":
+        return False
+    return True
+
+
+
+
+def time_to_minutes(t):
+    """Converts an already-validated 'HH:MM AM/PM' string to minutes since midnight."""
+    hour = int(t[0:2])
+    minute = int(t[3:5])
+    ampm = t[6:8]
+    if ampm == "AM" and hour == 12:
+        hour = 0
+    elif ampm == "PM" and hour != 12:
+        hour = hour + 12
+    return hour * 60 + minute
+
+
+
+
+def get_current_date_and_time():
+    now = datetime.now()
+    date_text = now.strftime("%B %d, %Y")
+    time_text = now.strftime("%I:%M %p")
+    day_name = now.strftime("%A")
+    return date_text, time_text, day_name
+
+
+
+
+def compute_status(class_start, login_time):
+    """Present = on time or within the grace period (<= 15 min late).
+    Late = more than 15 min late, up to and including 90 min late.
+    Absent = more than 90 min (1 hr 30 min) late.
+    This is only ever called once we already know the class has started,
+    so the difference here will never be negative."""
+    start_minutes = time_to_minutes(class_start)
+    login_minutes = time_to_minutes(login_time)
+    difference = login_minutes - start_minutes
+    if difference <= LATE_AFTER_MINUTES:
+        return "Present"
+    elif difference <= ABSENT_AFTER_MINUTES:
+        return "Late"
+    else:
+        return "Absent"
+
+
+
+
+def select_schedule_days(current_days=None):
+    """Console 'dropdown': the teacher can only pick from the 7 real
+    weekdays by number, so free text like 'Hello' can never be saved
+    as a schedule."""
+    print("\nSelect Class Schedule (choose one or more days):")
+    for i in range(len(VALID_DAYS)):
+        mark = ""
+        if current_days is not None and VALID_DAYS[i] in current_days:
+            mark = "  [currently selected]"
+        print(str(i + 1) + ". " + VALID_DAYS[i] + mark)
+
+
+    while True:
+        raw = ask("Enter the numbers separated by commas (e.g. 1,3): ")
+        pieces = raw.split(",")
+        selected = []
+        valid_entry = True
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece.isdigit():
+                valid_entry = False
+                break
+            number = int(piece)
+            if number < 1 or number > 7:
+                valid_entry = False
+                break
+            day_name = VALID_DAYS[number - 1]
+            if day_name not in selected:
+                selected.append(day_name)
+
+
+        if not valid_entry or len(selected) == 0:
+            print("Invalid selection. Please enter numbers from 1 to 7, separated by commas (e.g. 1,3).")
+            continue
+        return selected
+
+
+
+
+def format_days(day_list):
+    return ", ".join(day_list)
+
+
+
+
+def ask_start_and_end_time(existing_start=None, existing_end=None):
+    """Prompts for a Start Time and End Time, validating the format and
+    the logical order between them. Supports classes that cross midnight
+    (e.g. 10:30 PM -> 12:00 AM) by asking the teacher to confirm that
+    case explicitly, instead of silently guessing either way.
+    Returns (start_time, end_time, crosses_midnight)."""
+    start_prompt = "Enter Start Time (HH:MM AM/PM): "
+    end_prompt = "Enter End Time (HH:MM AM/PM): "
+    if existing_start is not None:
+        start_prompt = "Enter new Start Time (HH:MM AM/PM), current is " + existing_start + ": "
+        end_prompt = "Enter new End Time (HH:MM AM/PM), current is " + existing_end + ": "
+
+
+    while True:
+        start_time = ask(start_prompt)
+        if is_valid_time(start_time):
+            break
+        print("Invalid time format. Please enter a valid time using HH:MM AM/PM format. Example: 10:30 AM.")
+
+
+    while True:
+        end_time = ask(end_prompt)
+        if not is_valid_time(end_time):
+            print("Invalid time format. Please enter a valid time using HH:MM AM/PM format. Example: 10:30 AM.")
+            continue
+
+
+        start_minutes = time_to_minutes(start_time)
+        end_minutes = time_to_minutes(end_time)
+
+
+        if end_minutes > start_minutes:
+            # Normal, same-day class. No extra questions needed.
+            return start_time, end_time, False
+
+
+        # End Time is not after Start Time -- this could be a genuine
+        # overnight class (10:30 PM -> 12:00 AM) or a real mistake.
+        # Ask instead of silently assuming either way.
+        print("The End Time (" + end_time + ") is not after the Start Time (" + start_time + ").")
+        confirm = ask("Does this class end after midnight, on the next day? (yes/no): ").lower()
+        if confirm == "yes":
+            return start_time, end_time, True
+        else:
+            print("Invalid class schedule. The End Time must be after the Start Time.")
+            # loop back and ask for the End Time again
+
+
+
+
+def print_subjects_table(subjects_list, heading="My Current Classes"):
+    """Shows subjects/schedules as a table so the teacher can see what's
+    already there before adding, editing, or removing anything."""
+    print("\n--- " + heading + " ---")
+    if len(subjects_list) == 0:
+        print("No subjects added yet.")
+        return
+    rows = []
+    for subj in subjects_list:
+        time_range = subj[2] + " - " + subj[3]
+        if len(subj) > 5 and subj[5]:
+            time_range = time_range + " (ends next day)"
+        rows.append([subj[0], subj[1], format_days(subj[4]), time_range])
+    print_table(["Subject", "Section", "Days", "Time"], rows)
+
+
+
+
+# ==========================================================
+#  LOOKUP HELPERS
+# ==========================================================
+def find_student(student_id):
+    for s in students:
+        if s[0] == student_id:
+            return s
+    return None
+
+
+
+
+def find_subject(subject_name, section):
+    for subj in subjects:
+        if subj[0] == subject_name and subj[1] == section:
+            return subj
+    return None
+
+
+
+
+def get_registered_sections():
+    """Every section that has at least one registered student, plus every section
+    the teacher created in Add Subject (even if it has no students yet)."""
+    sections = []
+    for s in students:
+        if s[2] not in sections:
+            sections.append(s[2])
+    for section in created_sections:
+        if section not in sections:
+            sections.append(section)
+    return sections
+
+
+
+
+def select_registered_section():
+    """Console 'dropdown': the teacher can only pick from sections that
+    already exist, so a section can never be mistyped. Returns the
+    section name, or None if the teacher chose Back."""
+    sections = get_registered_sections()
+    if len(sections) == 0:
+        print("No registered sections yet. Add a student first.")
+        return None
+
+
+    pick = choose_option("Select Section:", sections)
+    if pick is None:
+        return None
+    return sections[pick]
+
+
+
+
+def section_already_exists(section):
+    """True if this section name is already used (capital letters do not matter)."""
+    for existing in get_attendance_sections():
+        if existing.upper() == section.upper():
+            return True
+    for subj in subjects:
+        if subj[1].upper() == section.upper():
+            return True
+    return False
+
+
+
+
+def select_section_for_subject():
+    """Pick an existing section from the list, or choose 'Add a new section'.
+    Returns (section, is_new_section), or None if the teacher chose Back."""
+    existing_sections = get_registered_sections()
+    pick = choose_option("Select Section:", existing_sections + ["Add a new section"])
+    if pick is None:
+        return None
+    if pick == len(existing_sections):
+        return ask_new_section(), True
+    return existing_sections[pick], False
+
+
+
+
+def get_attendance_sections():
+    """Registered sections, plus any section that still has saved attendance
+    records (for example after all its students were removed)."""
+    sections = get_registered_sections()
+    for record in attendance:
+        if record[2] not in sections:
+            sections.append(record[2])
+    return sections
+
+
+
+
+def get_attendance_subjects(section):
+    """Subjects scheduled for the section, plus any subject that still has
+    saved attendance records for it (for example a removed subject)."""
+    names = []
+    for subj in subjects:
+        if subj[1] == section and subj[0] not in names:
+            names.append(subj[0])
+    for record in attendance:
+        if record[2] == section and record[3] not in names:
+            names.append(record[3])
+    return names
+
+
+
+
+def date_sort_key(date_text):
+    return datetime.strptime(date_text, "%B %d, %Y")
+
+
+
+
+def get_record_dates(section, subject_name):
+    """Every date (oldest first) that has attendance records in the current
+    quarter for this section. subject_name=None means all subjects."""
+    dates = []
+    for record in attendance:
+        if record[4] != current_quarter or record[2] != section:
+            continue
+        if subject_name is not None and record[3] != subject_name:
+            continue
+        if record[5] not in dates:
+            dates.append(record[5])
+    dates.sort(key=date_sort_key)
+    return dates
+
+
+
+
+def select_section_and_subject(allow_all_subjects):
+    """Teacher picks a Section, then a Subject, from numbered lists.
+    Returns (section, subject_name), or None if the teacher chose Back.
+    subject_name is None when 'All Subjects' was chosen."""
+    sections = get_attendance_sections()
+    if len(sections) == 0:
+        print("No sections found yet.")
+        return None
+    pick = choose_option("Select Section:", sections)
+    if pick is None:
+        return None
+    section = sections[pick]
+
+
+    subject_names = get_attendance_subjects(section)
+    if len(subject_names) == 0:
+        print("No subjects found for " + section + ".")
+        return None
+    options = subject_names[:]
+    if allow_all_subjects:
+        options.append("All Subjects")
+    pick = choose_option("Select Subject for " + section + ":", options)
+    if pick is None:
+        return None
+    if allow_all_subjects and pick == len(subject_names):
+        return section, None
+    return section, subject_names[pick]
+
+
+
+
+def get_students_for_stats(section):
+    """Students of the section (id, name), plus removed students who still
+    have saved attendance records in that section."""
+    people = []
+    for s in students:
+        if s[2] == section:
+            people.append([s[0], s[1]])
+    for record in attendance:
+        if record[2] != section:
+            continue
+        known = False
+        for p in people:
+            if p[0] == record[0]:
+                known = True
+        if not known:
+            people.append([record[0], record[1]])
+    return people
+
+
+
+
+def get_tracking_start(subject):
+    """The first date this subject is checked for automatic Absent. The
+    sample subjects start on ATTENDANCE_START_DATE; a subject added later
+    starts the day after it was added."""
+    if len(subject) > 6:
+        return subject[6]
+    return ATTENDANCE_START_DATE
+
+
+
+
+def mark_missing_attendance_absent():
+    """Automatic Absent: from ATTENDANCE_START_DATE up to today, every class
+    that was scheduled on that weekday and is already more than 90 minutes
+    past its start time gets an Absent record for each student in that
+    section who never logged in. Records the teacher edits (for example
+    Absent -> Excuse) are never touched again."""
+    now = datetime.now()
+    today = now.date()
+    now_minutes = now.hour * 60 + now.minute
+
+
+    day = ATTENDANCE_START_DATE
+    while day <= today:
+        date_text = day.strftime("%B %d, %Y")
+        day_name = day.strftime("%A")
+        for subj in subjects:
+            if not is_subject_scheduled_today(subj, day_name):
+                continue
+            if day < get_tracking_start(subj):
+                continue
+            session = [date_text, subj[0], subj[1]]
+            if session in processed_sessions:
+                continue
+            # Today's class is only Absent once the 90-minute window is over.
+            if day == today and now_minutes <= time_to_minutes(subj[2]) + ABSENT_AFTER_MINUTES:
+                continue
+
+
+            for s in students:
+                if s[2] != subj[1]:
+                    continue
+                has_record = False
+                for record in attendance:
+                    if record[0] == s[0] and record[3] == subj[0] and record[5] == date_text:
+                        has_record = True
+                        break
+                if not has_record:
+                    attendance.append([s[0], s[1], s[2], subj[0],
+                                       current_quarter, date_text, "N/A", "Absent"])
+            processed_sessions.append(session)
+        day = day + timedelta(days=1)
+
+
+
+
+def is_subject_scheduled_today(subject, day_name):
+    return day_name in subject[4]
+
+
+
+
+def already_logged_today(student_id, subject_name, date_text, quarter):
+    for record in attendance:
+        if (record[0] == student_id and record[3] == subject_name
+                and record[5] == date_text and record[4] == quarter):
+            return record
+    return None
+
+
+
+
+# ==========================================================
+#  LOGIN  (first screen: Teacher or Student)
+# ==========================================================
+def teacher_login():
+    print("\n--- Teacher Login ---")
+    print(CANCEL_HINT)
+    attempts = 0
+    while attempts < 3:
+        username = ask("Enter Username: ")
+        password = ask("Enter Password: ")
+        if username == TEACHER_USERNAME and password == TEACHER_PASSWORD:
+            print("\nWelcome, Teacher!")
+            teacher_dashboard()
+            return
+        attempts = attempts + 1
+        print("Incorrect username or password. Please try again.")
+    print("Too many incorrect attempts. Returning to main menu.")
+
+
+
+
+def student_login():
+    print("\n--- Student Login ---")
+    print(CANCEL_HINT)
+
+
+    # Keep asking until the ID has the right format AND is registered.
+    while True:
+        student_id = ask("Enter Student ID (e.g. 02-2627-010147): ")
+        if not is_valid_student_id(student_id):
+            print("Error: Invalid Student ID. Please enter a valid Student ID and try again.")
+            continue
+        student = find_student(student_id)
+        if student is None:
+            print("Error: Student ID not found. Please check your ID and try again.")
+            continue
+        break
+
+
+    # Keep asking until the section matches the one registered for that ID.
+    while True:
+        section = ask("Enter Section: ")
+        if section == student[2]:
+            break
+        print("Error: The Student ID and Section do not match our records. Please check your information and try again.")
+
+
+    print("\nWelcome, " + student[1] + "!")
+    student_dashboard(student)
+
+
+
+
+# ==========================================================
+#  STUDENT SIDE
+#  (view only -- a student can never edit/change any record)
+# ==========================================================
+def student_dashboard(student):
+    while True:
+        mark_missing_attendance_absent()
+        print("\n----- STUDENT DASHBOARD -----")
+        print("Name:", student[1])
+        print("Student ID:", student[0])
+        print("Section:", student[2])
+        print("Quarter:", current_quarter)
+        print("1. Today's Attendance")
+        print("2. Attendance History")
+        print("3. Logout")
+        choice = input("Enter your choice: ").strip()
+
+
+        if choice == "1":
+            run_action(attendance_today, student)
+        elif choice == "2":
+            view_attendance_history(student)
+        elif choice == "3":
+            print("Logging out...")
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+
+
+
+def attendance_today(student):
+    """Shows the subjects registered for this student's section as a table.
+    The student picks a subject to check their attendance for it."""
+    mark_missing_attendance_absent()
+    date_text, _, _ = get_current_date_and_time()
+
+
+    print("\n--- Today's Attendance (" + date_text + ") ---")
+    my_subjects = []
+    for subj in subjects:
+        if subj[1] == student[2]:
+            my_subjects.append(subj)
+
+
+    if len(my_subjects) == 0:
+        print("No subjects are registered for your section yet.")
+        return
+
+
+    rows = []
+    for i in range(len(my_subjects)):
+        subj = my_subjects[i]
+        existing = already_logged_today(student[0], subj[0], date_text, current_quarter)
+        if existing is not None:
+            status_text = existing[7]
+        else:
+            status_text = "Check Attendance"
+        rows.append([i + 1, subj[0], subj[1], status_text])
+    print_table(["No.", "Subject", "Section", "Status"], rows)
+
+
+    print("\n" + CANCEL_HINT)
+    while True:
+        pick = ask("Enter the number of the subject to check attendance (or press Enter to go back): ")
+        if pick == "":
+            return
+        if pick.isdigit() and 1 <= int(pick) <= len(my_subjects):
+            break
+        print("Invalid selection. Please try again.")
+
+
+    log_student_attendance(student, my_subjects[int(pick) - 1][0])
+
+
+
+
+def log_student_attendance(student, subject_name):
+    # Step 1: subject + section must exactly match a real, scheduled class.
+    subject = find_subject(subject_name, student[2])
+    if subject is None:
+        print("No matching section or subject was found. Please check your information and try again.")
+        return
+
+
+    # The date and time always come from the computer's clock -- the
+    # student can never type or choose them.
+    date_text, time_text, day_name = get_current_date_and_time()
+
+
+    # Step 2: is this subject even scheduled today? If not, stop here --
+    # never create a record and never mark the student Absent.
+    if not is_subject_scheduled_today(subject, day_name):
+        print("You do not have a class for this subject today.")
+        return
+
+
+    # Step 3: was attendance for this class already recorded today?
+    existing = already_logged_today(student[0], subject_name, date_text, current_quarter)
+    if existing is not None:
+        print("Your attendance for this class has already been recorded today.")
+        print("Status:", existing[7])
+        return
+
+
+    # Step 4: has the class actually started yet? If not, do not mark
+    # Absent and do not create a record -- just tell them to come back.
+    if time_to_minutes(time_text) < time_to_minutes(subject[2]):
+        print("You are too early. Your class starts at " + subject[2] + ".")
+        return
+
+
+    # Step 5: only now do we calculate Present / Late / Absent.
+    status = compute_status(subject[2], time_text)
+    attendance.append([student[0], student[1], student[2], subject_name,
+                        current_quarter, date_text, time_text, status])
+    print("\nAttendance recorded!")
+    print("Subject:", subject_name)
+    print("Section:", student[2])
+    print("Date:", date_text)
+    print("Time:", time_text)
+    print("Quarter:", current_quarter)
+    print("Status:", status)
+
+
+
+
+def view_attendance_history(student):
+    mark_missing_attendance_absent()
+    print("\n--- Attendance History for", student[1], "---")
+    rows = []
+    for record in attendance:
+        if record[0] == student[0]:
+            rows.append([record[5], record[6], record[3], record[4], record[7]])
+    if len(rows) == 0:
+        print("No attendance records found.")
+    else:
+        print_table(["Date", "Time", "Subject", "Quarter", "Status"], rows)
+
+
+
+
+# ==========================================================
+#  TEACHER SIDE
+#  Organized into clear categories: Students /
+#  Subjects & Schedules / Attendance / Quarter
+# ==========================================================
+def teacher_dashboard():
+    global current_quarter
+    while True:
+        mark_missing_attendance_absent()
+        print("\n===== TEACHER DASHBOARD (" + current_quarter + ") =====")
+        print("1. Students")
+        print("2. Subjects & Schedules")
+        print("3. Attendance")
+        print("4. Quarter")
+        print("5. Logout")
+        choice = input("Enter your choice: ").strip()
+
+
+        if choice == "1":
+            students_menu()
+        elif choice == "2":
+            subjects_menu()
+        elif choice == "3":
+            attendance_menu()
+        elif choice == "4":
+            try:
+                current_quarter = switch_quarter()
+            except CancelInput:
+                print("\nCancelled. Returning to the previous menu.")
+        elif choice == "5":
+            print("Logging out...")
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+
+
+
+# ---------------- Attendance functions (used by the Attendance menu) ----------------
+def teacher_today_attendance():
+    date_text, _, _ = get_current_date_and_time()
+    print("\n--- Today's Attendance (" + date_text + ") ---")
+    rows = []
+    for record in attendance:
+        if record[5] == date_text and record[4] == current_quarter:
+            rows.append([record[6], record[1], record[2], record[3], record[7]])
+    if len(rows) == 0:
+        print("No attendance has been recorded yet today.")
+    else:
+        print_table(["Time", "Student", "Section", "Subject", "Status"], rows)
+
+
+
+
+def teacher_attendance_summary():
+    print("\n--- Attendance Summary (" + current_quarter + ") ---")
+    print(CANCEL_HINT)
+
+
+    # Step 1: the teacher picks one of the sections that really exist.
+    sections = get_attendance_sections()
+    if len(sections) == 0:
+        print("No sections found yet.")
+        return
+    pick = choose_option("Choose a section:", sections, "Back",
+                         "Invalid choice. Please select one of the available sections.")
+    if pick is None:
+        return
+    section = sections[pick]
+
+
+    print("\n--- Attendance Summary - " + section + " (" + current_quarter + ") ---")
+
+
+    # Step 2: a section with no subject/schedule has nothing to summarize.
+    # Nobody is counted as Absent just because there is no class.
+    section_subjects = []
+    for subj in subjects:
+        if subj[1] == section:
+            section_subjects.append(subj[0])
+    if len(section_subjects) == 0:
+        print("No subject/schedule is currently assigned to this section.")
+        return
+
+
+    section_students = get_students_in_section(section)
+    if len(section_students) == 0:
+        print("There are no students in this section.")
+        return
+
+
+    # Step 3: count each student's real records (this section, current quarter).
+    print("Subjects: " + ", ".join(section_subjects))
+    rows = []
+    for s in section_students:
+        present_count = 0
+        late_count = 0
+        absent_count = 0
+        excuse_count = 0
+        for record in attendance:
+            if record[0] != s[0] or record[2] != section or record[4] != current_quarter:
+                continue
+            if record[7] == "Present":
+                present_count = present_count + 1
+            elif record[7] == "Late":
+                late_count = late_count + 1
+            elif record[7] == "Absent":
+                absent_count = absent_count + 1
+            elif record[7] == "Excuse":
+                excuse_count = excuse_count + 1
+        total = present_count + late_count + absent_count + excuse_count
+        rows.append([s[1], s[0], present_count, late_count, absent_count, excuse_count, total])
+    print_table(["Student Name", "Student ID", "Present", "Late", "Absent", "Excuse", "Total Records"], rows)
+
+
+
+
+# ---------------- Students category ----------------
+def students_menu():
+    while True:
+        print("\n--- Students ---")
+        print("1. View Students")
+        print("2. Add Student")
+        print("3. Remove Student")
+        print("4. Edit Student")
+        print("5. Back")
+        choice = input("Enter your choice: ").strip()
+        if choice == "1":
+            run_action(view_students)
+        elif choice == "2":
+            run_action(add_student)
+        elif choice == "3":
+            run_action(remove_student)
+        elif choice == "4":
+            run_action(edit_student_from_list)
+        elif choice == "5":
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+
+
+
+def get_students_in_section(section):
+    section_students = []
+    for s in students:
+        if s[2] == section:
+            section_students.append(s)
+    return section_students
+
+
+
+
+def print_section_students_table(section_students):
+    """Students of one section as a numbered table."""
+    rows = []
+    for i in range(len(section_students)):
+        s = section_students[i]
+        rows.append([i + 1, s[0], s[1], s[2]])
+    print_table(["No.", "Student ID", "Student Name", "Section"], rows)
+
+
+
+
+def view_students():
+    """Only shows the students of a section. Adding, removing, and editing
+    students are separate options in the Students menu."""
+    print("\n--- View Students ---")
+    print(CANCEL_HINT)
+    section = select_registered_section()
+    if section is None:
+        return
+
+
+    section_students = get_students_in_section(section)
+    if len(section_students) == 0:
+        print("\nThere are no students in " + section + " yet.")
+        return
+
+
+    print("\n--- Students in " + section + " (" + str(len(section_students)) + " students) ---")
+    print_section_students_table(section_students)
+
+
+
+
+def edit_student_from_list():
+    print("\n--- Edit Student ---")
+    print(CANCEL_HINT)
+    section = select_registered_section()
+    if section is None:
+        return
+
+
+    section_students = get_students_in_section(section)
+    if len(section_students) == 0:
+        print("\nThere are no students in " + section + " yet.")
+        return
+    print("\n--- Students in " + section + " (" + str(len(section_students)) + " students) ---")
+    print_section_students_table(section_students)
+
+
+    pick = choose_from_table("Enter the number of the student to edit (or press Enter to go back): ",
+                             len(section_students))
+    if pick is None:
+        return
+
+
+    edit_student(section_students[pick])
+
+
+
+
+def edit_student(target):
+    print("\n--- Edit Student ---")
+    print_students_table([target], False)
+
+
+    while True:
+        new_name = ask("Enter new Student Name (press Enter to keep the current name): ")
+        if new_name == "":
+            new_name = target[1]
+            break
+        if is_valid_student_name(new_name):
+            break
+        print("Error: Student Name can only contain letters and spaces. Please try again.")
+
+
+    new_section = target[2]
+    if ask_yes_no("Change the Section? (yes/no): "):
+        picked = select_registered_section()
+        if picked is not None:
+            new_section = picked
+
+
+    target[1] = new_name
+    target[2] = new_section
+    print("\nStudent updated successfully.")
+    print_students_table([target], False)
+
+
+
+
+def ask_new_section():
+    """Asks for a brand-new section name. Asks again until it is valid and not
+    already used. Capital letters are applied automatically (fb1-bsit-04 becomes FB1-BSIT-04)."""
+    while True:
+        section = ask("Enter the new Section (letters, numbers, and hyphens only, e.g. FB1-BSIT-04): ").upper()
+        if section == "":
+            print("Error: Section cannot be blank. Please try again.")
+        elif not is_valid_section_name(section):
+            print("Error: Invalid section name. Use only letters, numbers, and hyphens (no spaces or symbols), up to 20 characters.")
+        elif section_already_exists(section):
+            print("Error: This section already exists. Please enter a different section name.")
+        else:
+            return section
+
+
+
+
+def add_student():
+    print("\n--- Add Student ---")
+    print(CANCEL_HINT)
+
+
+    # Each answer is asked again until it is correct, so a mistake never
+    # sends the teacher back to the menu.
+    while True:
+        student_id = ask("Enter Student ID (e.g. 02-2627-010147): ")
+        if not is_valid_student_id(student_id):
+            print("Error: Invalid Student ID. Please try again.")
+        elif find_student(student_id) is not None:
+            print("Error: This Student ID already exists. Please try again.")
+        else:
+            break
+
+
+    while True:
+        name = ask("Enter Student Name: ")
+        if name == "":
+            print("Error: Student Name cannot be blank. Please try again.")
+        elif not is_valid_student_name(name):
+            print("Error: Student Name can only contain letters and spaces. Please try again.")
+        else:
+            break
+
+
+    # Pick an existing section from the list, or add a brand-new one.
+    existing_sections = get_registered_sections()
+    if len(existing_sections) == 0:
+        section = ask_new_section()
+    else:
+        pick = choose_option("Select Section:", existing_sections + ["Add a new section"])
+        if pick is None:
+            print("Add Student cancelled.")
+            return
+        if pick == len(existing_sections):
+            section = ask_new_section()
+        else:
+            section = existing_sections[pick]
+
+
+    students.append([student_id, name, section])
+    print("\nStudent successfully added.")
+    print_students_table([[student_id, name, section]], False)
+
+
+
+
+def remove_student():
+    print("\n--- Remove Student ---")
+    print(CANCEL_HINT)
+    section = select_registered_section()
+    if section is None:
+        return
+
+
+    section_students = get_students_in_section(section)
+    if len(section_students) == 0:
+        print("\nThere are no students in " + section + " yet.")
+        return
+    print("\n--- Students in " + section + " (" + str(len(section_students)) + " students) ---")
+    print_section_students_table(section_students)
+
+
+    pick = choose_from_table("Enter the number of the student to remove (or press Enter to go back): ",
+                             len(section_students))
+    if pick is None:
+        return
+
+
+    confirm_remove_student(section_students[pick])
+
+
+
+
+def confirm_remove_student(target):
+    print("\nYou are about to remove:")
+    print_students_table([target], False)
+    print("Are you sure you want to remove this student?")
+    if ask_yes_no("Type 'yes' to confirm or 'no' to cancel: "):
+        # Historical attendance records are intentionally left untouched here --
+        # removing a student only takes them off the active roster (see view_statistics,
+        # which still shows their past records using the name/section saved on each record).
+        students.remove(target)
+        print("Student removed from the active list. Their attendance history remains saved.")
+    else:
+        print("Remove cancelled.")
+
+
+
+
+# ---------------- Subjects & Schedules category ----------------
+def subjects_menu():
+    while True:
+        print("\n--- Subjects & Schedules ---")
+        print("1. Add Subject")
+        print("2. Edit Subject")
+        print("3. Remove Subject")
+        print("4. Back")
+        choice = input("Enter your choice: ").strip()
+        if choice == "1":
+            run_action(add_subject)
+        elif choice == "2":
+            run_action(edit_subject)
+        elif choice == "3":
+            run_action(remove_subject)
+        elif choice == "4":
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+
+
+
+def add_subject():
+    # Show what's already there first, so the teacher doesn't have to
+    # remember or re-check before adding a new one.
+    print_subjects_table(subjects, "My Current Classes")
+
+
+    print("\n--- Add New Subject ---")
+    print(CANCEL_HINT)
+    while True:
+        name = ask("Enter Subject Name: ")
+        if name == "":
+            print("Error: Subject Name cannot be blank. Please try again.")
+            continue
+
+
+        picked = select_section_for_subject()
+        if picked is None:
+            return
+        section, is_new_section = picked
+
+
+        if find_subject(name, section) is None:
+            break
+        print("Error: This subject is already scheduled for that section. Use Edit Subject instead, or try a different subject/section.")
+
+
+    start_time, end_time, crosses_midnight = ask_start_and_end_time()
+    schedule_days = select_schedule_days()
+
+
+    # 7th field: first date this subject is checked for automatic Absent
+    # (the day after it was added).
+    tracking_start = datetime.now().date() + timedelta(days=1)
+    new_subject = [name, section, start_time, end_time, schedule_days, crosses_midnight, tracking_start]
+    subjects.append(new_subject)
+    if is_new_section:
+        created_sections.append(section)      # saved only now, after the whole subject was entered
+        print("\nNew section " + section + " was added.")
+    print("\nSubject added successfully.")
+    print_subjects_table([new_subject], "New Subject")
+
+
+
+
+def select_existing_subject(action_word):
+    """Shows every registered subject in a numbered table and lets the
+    teacher pick one by number, so a subject or section that does not
+    exist can never be entered. Returns the subject, or None for Back."""
+    if len(subjects) == 0:
+        print("No subjects added yet.")
+        return None
+    rows = []
+    for i in range(len(subjects)):
+        subj = subjects[i]
+        time_range = subj[2] + " - " + subj[3]
+        if len(subj) > 5 and subj[5]:
+            time_range = time_range + " (ends next day)"
+        rows.append([i + 1, subj[0], subj[1], format_days(subj[4]), time_range])
+    print("\n--- My Current Classes ---")
+    print_table(["No.", "Subject", "Section", "Days", "Time"], rows)
+    pick = choose_from_table("Enter the number of the subject to " + action_word + " (or press Enter to go back): ",
+                             len(subjects))
+    if pick is None:
+        return None
+    return subjects[pick]
+
+
+
+
+def edit_subject():
+    print("\n--- Edit Subject ---")
+    print(CANCEL_HINT)
+    subject = select_existing_subject("edit")
+    if subject is None:
+        return
+
+
+    print_subjects_table([subject], "Current Details")
+
+
+    start_time, end_time, crosses_midnight = ask_start_and_end_time(subject[2], subject[3])
+
+
+    if ask_yes_no("Change the Class Schedule days? (yes/no): "):
+        schedule_days = select_schedule_days(subject[4])
+    else:
+        schedule_days = subject[4]
+
+
+    subject[2] = start_time
+    subject[3] = end_time
+    subject[4] = schedule_days
+    # Older subject records may not have this 6th field yet; extend if needed.
+    if len(subject) > 5:
+        subject[5] = crosses_midnight
+    else:
+        subject.append(crosses_midnight)
+
+
+    print("\nSubject updated successfully.")
+    print_subjects_table([subject], "Updated Subject")
+
+
+
+
+def remove_subject():
+    print("\n--- Remove Subject ---")
+    print(CANCEL_HINT)
+    subject = select_existing_subject("remove")
+    if subject is None:
+        return
+
+
+    print_subjects_table([subject], "You are about to remove")
+    print("Are you sure you want to remove this subject and its schedule?")
+    if ask_yes_no("Type 'yes' to confirm or 'no' to cancel: "):
+        subjects.remove(subject)
+        print("Subject removed from active schedule. Past attendance records remain saved.")
+    else:
+        print("Remove cancelled.")
+
+
+
+
+# ---------------- Attendance category ----------------
+def attendance_menu():
+    while True:
+        mark_missing_attendance_absent()
+        print("\n--- Attendance ---")
+        print("1. Today's Attendance")
+        print("2. Attendance Summary")
+        print("3. View Attendance Records")
+        print("4. Edit Attendance Status")
+        print("5. View Attendance Statistics")
+        print("6. Back")
+        choice = input("Enter your choice: ").strip()
+        if choice == "1":
+            run_action(teacher_today_attendance)
+        elif choice == "2":
+            run_action(teacher_attendance_summary)
+        elif choice == "3":
+            run_action(view_attendance_records)
+        elif choice == "4":
+            run_action(edit_attendance_status)
+        elif choice == "5":
+            run_action(view_statistics)
+        elif choice == "6":
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+
+
+
+def record_date_key(record):
+    return date_sort_key(record[5])
+
+
+
+
+def view_attendance_records():
+    print("\n--- View Attendance Records (" + current_quarter + ") ---")
+    print(CANCEL_HINT)
+
+
+    # Section -> Subject -> Date, each picked from a numbered list.
+    picked = select_section_and_subject(True)
+    if picked is None:
+        return
+    section, subject_name = picked
+
+
+    dates = get_record_dates(section, subject_name)
+    if len(dates) == 0:
+        print("No attendance records found for this selection.")
+        return
+    pick = choose_option("Select Date:", dates + ["All Dates"])
+    if pick is None:
+        return
+    date_text = None
+    if pick < len(dates):
+        date_text = dates[pick]
+
+
+    matches = []
+    for record in attendance:
+        if record[4] != current_quarter or record[2] != section:
+            continue
+        if subject_name is not None and record[3] != subject_name:
+            continue
+        if date_text is not None and record[5] != date_text:
+            continue
+        matches.append(record)
+    matches.sort(key=record_date_key)
+
+
+    heading = section
+    if subject_name is not None:
+        heading = heading + " | " + subject_name
+    if date_text is not None:
+        heading = heading + " | " + date_text
+    print("\n--- Attendance Records: " + heading + " ---")
+    rows = []
+    for record in matches:
+        rows.append([record[5], record[6], record[0], record[1], record[3], record[7]])
+    print_table(["Date", "Time", "Student ID", "Student", "Subject", "Status"], rows)
+
+
+
+
+def edit_attendance_status():
+    print("\n--- Edit Attendance Status ---")
+    print(CANCEL_HINT)
+
+
+    # Section -> Subject -> Date -> Student, each picked by number.
+    picked = select_section_and_subject(False)
+    if picked is None:
+        return
+    section, subject_name = picked
+
+
+    dates = get_record_dates(section, subject_name)
+    if len(dates) == 0:
+        print("No attendance records found for this selection.")
+        return
+    pick = choose_option("Select Date:", dates)
+    if pick is None:
+        return
+    date_text = dates[pick]
+
+
+    matches = []
+    for record in attendance:
+        if (record[4] == current_quarter and record[2] == section
+                and record[3] == subject_name and record[5] == date_text):
+            matches.append(record)
+
+
+    print("\n--- " + subject_name + " | " + section + " | " + date_text + " ---")
+    rows = []
+    for i in range(len(matches)):
+        r = matches[i]
+        rows.append([i + 1, r[0], r[1], r[6], r[7]])
+    print_table(["No.", "Student ID", "Student", "Time", "Status"], rows)
+
+
+    pick = choose_from_table("Enter the number of the student to edit (or press Enter to go back): ",
+                             len(matches))
+    if pick is None:
+        return
+    target = matches[pick]
+
+
+    print("\nCurrent Status of " + target[1] + ": " + target[7])
+    statuses = ["Present", "Late", "Absent", "Excuse"]
+    new_pick = choose_option("Select the new status:", statuses, "Cancel/Back")
+    if new_pick is None:
+        print("Status not changed.")
+        return
+
+
+    target[7] = statuses[new_pick]
+    print("Status updated successfully.")
+    print_table(["Date", "Time", "Student", "Subject", "Status"],
+                [[target[5], target[6], target[1], target[3], target[7]]])
+
+
+
+
+def view_statistics():
+    print("\n--- View Attendance Statistics (" + current_quarter + ") ---")
+    print(CANCEL_HINT)
+
+
+    sections = get_attendance_sections()
+    if len(sections) == 0:
+        print("No sections found yet.")
+        return
+    pick = choose_option("Select Section:", sections)
+    if pick is None:
+        return
+    section = sections[pick]
+
+
+    people = get_students_for_stats(section)
+    if len(people) == 0:
+        print("No students found in " + section + ".")
+        return
+    print("\n--- Students in " + section + " ---")
+    rows = []
+    for i in range(len(people)):
+        rows.append([i + 1, people[i][0], people[i][1]])
+    print_table(["No.", "Student ID", "Student Name"], rows)
+
+
+    pick = choose_from_table("Enter the number of the student to view (or press Enter to go back): ",
+                             len(people))
+    if pick is None:
+        return
+    student_id = people[pick][0]
+    display_name = people[pick][1]
+
+
+    student_records = []
+    for record in attendance:
+        if record[0] == student_id and record[4] == current_quarter:
+            student_records.append(record)
+    student_records.sort(key=record_date_key)
+
+
+    # The student may have been removed from the active roster -- the
+    # section picked above is then used for display.
+    student = find_student(student_id)
+    if student is not None:
+        display_section = student[2]
+    else:
+        display_section = section
+
+
+    present_count = 0
+    late_count = 0
+    excuse_count = 0
+    absent_count = 0
+    for record in student_records:
+        if record[7] == "Present":
+            present_count = present_count + 1
+        elif record[7] == "Late":
+            late_count = late_count + 1
+        elif record[7] == "Excuse":
+            excuse_count = excuse_count + 1
+        elif record[7] == "Absent":
+            absent_count = absent_count + 1
+
+
+    total = present_count + late_count + excuse_count + absent_count
+    print("\nStudent:", display_name)
+    print("Section:", display_section)
+    print("Quarter:", current_quarter)
+    print_table(["Status", "Total"], [
+        ["Present", present_count],
+        ["Late", late_count],
+        ["Excuse", excuse_count],
+        ["Absent", absent_count],
+        ["All Attendance Records", total],
+    ])
+
+
+    if total > 0:
+        print("\n--- Detailed Attendance History ---")
+        rows = []
+        for record in student_records:
+            rows.append([record[5], record[6], record[3], record[7]])
+        print_table(["Date", "Time", "Subject", "Status"], rows)
+
+
+
+
+# ---------------- Quarter ----------------
+def switch_quarter():
+    print("Current Quarter:", current_quarter)
+    print(CANCEL_HINT)
+    quarters = ["P1", "P2", "P3"]
+    pick = choose_option("Select Quarter:", quarters)
+    if pick is None:
+        print("Quarter not changed.")
+        return current_quarter
+    print("Switched to", quarters[pick])
+    return quarters[pick]
+
+
+
+
+# ==========================================================
+#  MAIN
+# ==========================================================
+def main():
+    print("===== ATTENDANCE MONITORING SYSTEM =====")
+    mark_missing_attendance_absent()
+    while True:
+        print("\n----- LOGIN -----")
+        print("1. Teacher")
+        print("2. Student")
+        print("3. Exit")
+        choice = input("Enter your choice: ").strip()
+        if choice == "1":
+            run_action(teacher_login)
+        elif choice == "2":
+            run_action(student_login)
+        elif choice == "3":
+            print("Thank you for using the system.")
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+
+
+
+if __name__ == "__main__":
+    main()
+
